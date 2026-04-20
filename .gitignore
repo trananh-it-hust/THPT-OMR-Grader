@@ -1,0 +1,29 @@
+# Environments
+.env
+.venv/
+env/
+venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Debug and Output
+output/
+*.log
+debug/
+core
+
+# IDE & AI generated
+.gemini/
+.agents/
+.vscode/
+.idea/
+CoreRules
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
