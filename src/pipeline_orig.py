@@ -201,7 +201,7 @@ def run_pipeline(image_arg: Optional[str] = None) -> None:
 
     sobao_danh = detect_sobao_danh_boxes(
         sbd_candidates, boxes_per_row=6, max_rows=10,
-        row_tolerance=50, size_tolerance_ratio=0.85, debug=False,
+        row_tolerance=45, size_tolerance_ratio=0.45, debug=False,
     )
     logger.info(f"SoBaoDanh rows: {sobao_danh['row_count']}")
     logger.info(f"SoBaoDanh boxes: {len(sobao_danh['sobao_danh'])}")
@@ -211,7 +211,7 @@ def run_pipeline(image_arg: Optional[str] = None) -> None:
     )
     ma_de = detect_ma_de_boxes(
         remaining_for_ma_de, boxes_per_row=3, max_rows=10,
-        row_tolerance=45, size_tolerance_ratio=0.95, debug=False,
+        row_tolerance=35, size_tolerance_ratio=0.40, debug=False,
     )
 
     # --- Affine retry ---
@@ -489,14 +489,9 @@ def run_pipeline(image_arg: Optional[str] = None) -> None:
     # --- Grid drawing + fill evaluation ---
     logger.info(f"\n=== Drawing grids on all parts ===")
     combined_grid_image = img.copy()
-    # Create a high-quality adaptive binary specifically for bubble detection.
-    # Simple thresholding captures too much noise from border intensity shifts.
-    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    binary_for_eval = cv2.adaptiveThreshold(
-        gray_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 51, 15
-    )
-    logger.info("Created adaptive binary for fill-ratio classification (refined for pencil marks)")
+    binary_threshold = data.get("binary")
+    if binary_threshold is not None:
+        logger.info("\nUsing binary threshold image for fill-ratio classification")
 
     part_i_evals: List[Dict[str, object]] = []
     if parts["part_i"]:
@@ -511,9 +506,9 @@ def run_pipeline(image_arg: Optional[str] = None) -> None:
         combined_grid_image = grid_result["image_with_grid"]
         print_grid_info(grid_result["grid_info"])
         part_i_evals = _evaluate_section_fill(
-            "Part I", binary_for_eval, grid_result["grid_info"],
-            fill_ratio_thresh=0.55, inner_margin_ratio=0.08,
-            circle_radius_scale=0.35, circle_border_exclude_ratio=0.20,
+            "Part I", binary_threshold, grid_result["grid_info"],
+            fill_ratio_thresh=0.54, inner_margin_ratio=0.05,
+            circle_radius_scale=0.6, circle_border_exclude_ratio=0.1,
         )
 
     part_ii_evals: List[Dict[str, object]] = []
@@ -543,9 +538,9 @@ def run_pipeline(image_arg: Optional[str] = None) -> None:
             ),
         )
         part_ii_evals = _evaluate_section_fill(
-            "Part II", binary_for_eval, grid_result_ii["grid_info"],
-            fill_ratio_thresh=0.55, inner_margin_ratio=0.05,
-            circle_radius_scale=0.35, circle_border_exclude_ratio=0.20,
+            "Part II", binary_threshold, grid_result_ii["grid_info"],
+            fill_ratio_thresh=0.54, inner_margin_ratio=0.01,
+            circle_radius_scale=0.6, circle_border_exclude_ratio=0.1,
         )
 
     part_iii_evals: List[Dict[str, object]] = []
@@ -566,9 +561,9 @@ def run_pipeline(image_arg: Optional[str] = None) -> None:
             detail_formatter=lambda info: f"pattern={info['pattern'][:2]}... (12 rows total)",
         )
         part_iii_evals = _evaluate_section_fill(
-            "Part III", binary_for_eval, grid_result_iii["grid_info"],
-            fill_ratio_thresh=0.55, inner_margin_ratio=0.08,
-            circle_radius_scale=0.35, circle_border_exclude_ratio=0.20,
+            "Part III", binary_threshold, grid_result_iii["grid_info"],
+            fill_ratio_thresh=0.54, inner_margin_ratio=0.05,
+            circle_radius_scale=0.6, circle_border_exclude_ratio=0.1,
         )
 
     # SBD / MaDe grid overlays
@@ -613,56 +608,51 @@ def run_pipeline(image_arg: Optional[str] = None) -> None:
 # =========================================================================
 
 
-def detect_image(
+def process_image(
     image: np.ndarray,
-    max_dim: int = 1600,
+    fill_ratio_part1: float = 0.55,
+    fill_ratio_part2: float = 0.55,
+    fill_ratio_part3: float = 0.55,
     debug_prefix: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Run the CV detection pipeline (morphology → parts → SBD/MaDe → grids).
+    """Run the full OMR pipeline on a pre-loaded image and return all results.
 
-    This is **stage 1** of the two-stage API.  The result is independent of
-    ``fill_ratio`` and can be **cached** in ``st.session_state``.  Call
-    :func:`grade_image` on the cached result whenever the user changes a
-    fill-ratio slider — no CV work is repeated.
+    This is the **primary entry point for the web UI** (``app.py``).
+    Unlike :func:`run_pipeline`, it accepts an already-decoded
+    ``np.ndarray`` instead of a file path, and returns a structured
+    result dict rather than writing everything to disk.
 
     Args:
         image: Input BGR image as ``np.ndarray``.
-        max_dim: Downscale longest dimension to this value before processing.
-            ``0`` or negative disables resizing.  Default 1600 gives a ~3-4×
-            speedup for 3MP+ scans with no accuracy loss.
-        debug_prefix: Path prefix for debug images (``None`` = skip I/O).
+        fill_ratio_part1: Bubble fill threshold for Part I (multiple-choice).
+        fill_ratio_part2: Bubble fill threshold for Part II (true/false).
+        fill_ratio_part3: Bubble fill threshold for Part III (numeric).
+        debug_prefix: If set, intermediate debug images are written with this
+            path prefix.  ``None`` skips all disk I/O.
 
     Returns:
-        Dict with keys that :func:`grade_image` and :func:`process_image`
-        depend on:
+        Dict with keys:
 
-        - ``\"img\"`` — the (possibly resized) BGR image used for processing
-        - ``\"preprocess_mode\"`` — ``\"base\"``, ``\"clahe\"``, or ``\"+topview-id\"``
-        - ``\"data\"`` — raw morphology output
-        - ``\"parts\"`` — ``{\"part_i\", \"part_ii\", \"part_iii\", \"all_parts\"}``
-        - ``\"sobao_danh\"`` — SoBaoDanh rows + digit info
-        - ``\"ma_de\"`` — MaDe rows + digit info
-        - ``\"split_x\"`` — horizontal ID split coordinate
-        - ``\"extrapolated\"`` — row extrapolation result
-        - ``\"sbd_digits\"`` — digit-decode result for SBD
-        - ``\"made_digits\"`` — digit-decode result for MaDe
-        - ``\"grid_info_i\"`` — grid cell metadata for Part I
-        - ``\"grid_info_ii\"`` — grid cell metadata for Part II
-        - ``\"grid_info_iii\"`` — grid cell metadata for Part III
-        - ``\"parts_overlay\"`` — BGR image with Part I/II/III outlines
-        - ``\"binary_threshold\"`` — binary mask used for fill scoring
+        - ``"preprocess_mode"`` — ``"base"`` or ``"clahe"`` (or ``"+topview-id"``)
+        - ``"data"`` — raw morphology output (``boxes``, ``binary``, …)
+        - ``"parts"`` — ``{"part_i": …, "part_ii": …, "part_iii": …, "all_parts": …}``
+        - ``"sobao_danh"`` — SoBaoDanh detection result
+        - ``"ma_de"`` — MaDe detection result
+        - ``"split_x"`` — horizontal split coordinate
+        - ``"extrapolated"`` — row extrapolation result
+        - ``"sbd_digits"`` — digit-decode result for SBD
+        - ``"made_digits"`` — digit-decode result for MaDe
+        - ``"part_i_evals"`` — cell evaluation list for Part I
+        - ``"part_ii_evals"`` — cell evaluation list for Part II
+        - ``"part_iii_evals"`` — cell evaluation list for Part III
+        - ``"parts_overlay"`` — BGR image with Part I/II/III outlines
+        - ``"result_image"`` — BGR image with grids + filled-cell overlay
+        - ``"binary_threshold"`` — binary mask used for fill scoring
     """
-    from src.preprocessing import resize_for_processing
-
     if image is None or image.size == 0:
-        raise ValueError("detect_image() received an empty or None image array.")
+        raise ValueError("process_image() received an empty or None image array.")
 
-    # --- Optional resize ---
-    if max_dim and max_dim > 0:
-        img = resize_for_processing(image, max_dim=max_dim)
-    else:
-        img = image.copy()
-
+    img = image.copy()
     page_h = img.shape[0]
 
     # ------------------------------------------------------------------
@@ -757,6 +747,17 @@ def detect_image(
                 sobao_danh = sobao_danh_affine
                 ma_de = ma_de_affine
                 preprocess_mode = f"{preprocess_mode}+topview-id"
+                logger.info(
+                    f"[Topview] Retry improved ID detection: score {old_score} -> {new_score} "
+                    f"(SBD={sobao_danh['row_count']}, MaDe={ma_de['row_count']})"
+                )
+            else:
+                logger.info(
+                    f"[Topview] Retry no improvement: score {old_score} -> {new_score} "
+                    f"(SBD={sobao_danh_affine['row_count']}, MaDe={ma_de_affine['row_count']})"
+                )
+        else:
+            logger.info("[Topview] Retry skipped: not enough reliable corner markers")
 
     # ------------------------------------------------------------------
     # 2.1 Synthetic fallback for severely misaligned/faint SBD/MDT
@@ -773,6 +774,7 @@ def detect_image(
             sobao_danh["sobao_danh_rows"] = sobao_rows_synth
             sobao_danh["sobao_danh"] = [b for row in sobao_rows_synth for b in row]
             sobao_danh["row_count"] = len(sobao_rows_synth)
+            logger.info(f"[Fallback] SoBaoDanh rows <= {id_fallback_row_threshold}, applied synthetic grid.")
 
     if ma_de["row_count"] <= id_fallback_row_threshold:
         ma_de_rows_synth = _build_synthetic_id_rows_fixed_image_position(
@@ -785,6 +787,7 @@ def detect_image(
             ma_de["ma_de_rows"] = ma_de_rows_synth
             ma_de["ma_de"] = [b for row in ma_de_rows_synth for b in row]
             ma_de["row_count"] = len(ma_de_rows_synth)
+            logger.info(f"[Fallback] MaDe rows <= {id_fallback_row_threshold}, applied synthetic grid.")
 
     # ------------------------------------------------------------------
     # 3. MaDe completion (fill missing rows using SBD reference grid)
@@ -871,16 +874,12 @@ def detect_image(
     draw_rows_contours(overlay, ma_de["ma_de_rows"],           (255, 255, 0), thickness=2)
 
     # ------------------------------------------------------------------
-    # 6. Grid + Hough fill-ratio pre-computation (threshold-independent)
+    # 6. Grid drawing + fill evaluation (per-part thresholds)
     # ------------------------------------------------------------------
-    # Raw fill_ratio values are computed here ONCE and cached in the detection
-    # result. grade_image() then only applies a numerical threshold — no CV work.
-    # This makes slider updates for 150 images take < 5 ms total.
     combined_grid_image = img.copy()
     binary_threshold = data.get("binary")
 
-    grid_info_i: List[Dict[str, object]] = []
-    raw_evals_i: List[Dict[str, object]] = []
+    part_i_evals: List[Dict[str, object]] = []
     if parts["part_i"]:
         grid_result = extract_grid_from_boxes(
             combined_grid_image, boxes=parts["part_i"],
@@ -890,21 +889,18 @@ def detect_image(
             grid_color=(0, 255, 0),      grid_thickness=1,
         )
         combined_grid_image = grid_result["image_with_grid"]
-        grid_info_i = grid_result["grid_info"]
         if binary_threshold is not None:
-            # threshold=0.0 → every cell counted; we store raw fill_ratio
-            raw_evals_i = evaluate_grid_fill_from_binary(
+            part_i_evals = evaluate_grid_fill_from_binary(
                 binary_image=binary_threshold,
-                grid_info=grid_info_i,
-                fill_ratio_thresh=0.0,
+                grid_info=grid_result["grid_info"],
+                fill_ratio_thresh=float(fill_ratio_part1),
                 inner_margin_ratio=0.05,
                 mask_mode="hough-circle",
                 circle_radius_scale=0.5,
                 circle_border_exclude_ratio=0.0,
             )
 
-    grid_info_ii: List[Dict[str, object]] = []
-    raw_evals_ii: List[Dict[str, object]] = []
+    part_ii_evals: List[Dict[str, object]] = []
     if parts["part_ii"]:
         part_ii_count = len(parts["part_ii"])
         offset_ratios = [(0.3, 0.33) if i % 2 == 0 else (0.0, 0.33) for i in range(part_ii_count)]
@@ -917,20 +913,18 @@ def detect_image(
             grid_color=(0, 165, 255), grid_thickness=1,
         )
         combined_grid_image = grid_result_ii["image_with_grid"]
-        grid_info_ii = grid_result_ii["grid_info"]
         if binary_threshold is not None:
-            raw_evals_ii = evaluate_grid_fill_from_binary(
+            part_ii_evals = evaluate_grid_fill_from_binary(
                 binary_image=binary_threshold,
-                grid_info=grid_info_ii,
-                fill_ratio_thresh=0.0,
+                grid_info=grid_result_ii["grid_info"],
+                fill_ratio_thresh=float(fill_ratio_part2),
                 inner_margin_ratio=0.05,
                 mask_mode="hough-circle",
                 circle_radius_scale=0.5,
                 circle_border_exclude_ratio=0.0,
             )
 
-    grid_info_iii: List[Dict[str, object]] = []
-    raw_evals_iii: List[Dict[str, object]] = []
+    part_iii_evals: List[Dict[str, object]] = []
     if parts["part_iii"]:
         custom_pattern = [[0], [1, 2]] + [[0, 1, 2, 3] for _ in range(10)]
         grid_result_iii = extract_grid_from_boxes_custom_pattern(
@@ -942,26 +936,32 @@ def detect_image(
             row_col_patterns=custom_pattern,
         )
         combined_grid_image = grid_result_iii["image_with_grid"]
-        grid_info_iii = grid_result_iii["grid_info"]
         if binary_threshold is not None:
-            raw_evals_iii = evaluate_grid_fill_from_binary(
+            part_iii_evals = evaluate_grid_fill_from_binary(
                 binary_image=binary_threshold,
-                grid_info=grid_info_iii,
-                fill_ratio_thresh=0.0,
+                grid_info=grid_result_iii["grid_info"],
+                fill_ratio_thresh=float(fill_ratio_part3),
                 inner_margin_ratio=0.05,
                 mask_mode="hough-circle",
                 circle_radius_scale=0.5,
                 circle_border_exclude_ratio=0.0,
             )
 
+    # SBD / MaDe grid overlays on result image
     draw_rows_contours(combined_grid_image, sobao_danh["sobao_danh_rows"], (255, 128, 0), thickness=1)
     draw_rows_contours(combined_grid_image, ma_de["ma_de_rows"],           (255, 255, 0), thickness=1)
 
     combined_grid_image = draw_digit_darkness_overlay(combined_grid_image, sbd_digits,  color=(0, 220, 255), alpha=0.40)
     combined_grid_image = draw_digit_darkness_overlay(combined_grid_image, made_digits, color=(0, 255, 255), alpha=0.40)
 
+    all_evals = part_i_evals + part_ii_evals + part_iii_evals
+    if all_evals:
+        combined_grid_image = draw_filled_cells_overlay(combined_grid_image, all_evals, color=(0, 255, 0), alpha=0.35)
+
+    # ------------------------------------------------------------------
+    # 7. Return structured result dict
+    # ------------------------------------------------------------------
     return {
-        "img":              combined_grid_image,   # base grid image (no fill overlay yet)
         "preprocess_mode":  preprocess_mode,
         "data":             data,
         "parts":            parts,
@@ -971,120 +971,10 @@ def detect_image(
         "extrapolated":     extrapolated,
         "sbd_digits":       sbd_digits,
         "made_digits":      made_digits,
-        "grid_info_i":      grid_info_i,
-        "grid_info_ii":     grid_info_ii,
-        "grid_info_iii":    grid_info_iii,
-        "raw_evals_i":      raw_evals_i,    # pre-computed fill_ratio, threshold NOT applied
-        "raw_evals_ii":     raw_evals_ii,
-        "raw_evals_iii":    raw_evals_iii,
-        "parts_overlay":    overlay,
-        "binary_threshold": binary_threshold,
-    }
-
-
-def grade_image(
-    detection: Dict[str, object],
-    fill_ratio_part1: float = 0.55,
-    fill_ratio_part2: float = 0.55,
-    fill_ratio_part3: float = 0.55,
-) -> Dict[str, object]:
-    """Apply fill-ratio thresholds to pre-computed raw evals from :func:`detect_image`.
-
-    This is **stage 2** of the two-stage API.  Because :func:`detect_image`
-    pre-computes all Hough circle measurements and stores raw ``fill_ratio``
-    values (threshold-independent), this function performs only numerical
-    comparisons — **no image processing or CV work at all**.
-
-    Time complexity: O(N_cells) pure Python comparisons ≈ **< 0.5 ms / image**,
-    making slider updates for 150 images essentially instantaneous (< 100 ms
-    total, dominated by the overlay redraw).
-
-    Args:
-        detection: Dict returned by :func:`detect_image`.
-        fill_ratio_part1: Bubble fill threshold for Part I.
-        fill_ratio_part2: Bubble fill threshold for Part II.
-        fill_ratio_part3: Bubble fill threshold for Part III.
-
-    Returns:
-        Same-shaped dict as :func:`process_image` (all keys present).
-    """
-    thresh1 = float(fill_ratio_part1)
-    thresh2 = float(fill_ratio_part2)
-    thresh3 = float(fill_ratio_part3)
-
-    # Re-apply threshold to pre-computed fill_ratio values — no Hough re-run
-    def _apply_thresh(
-        raw_evals: List[Dict[str, object]], thresh: float
-    ) -> List[Dict[str, object]]:
-        result = []
-        for e in raw_evals:
-            fr = float(e.get("fill_ratio", 0.0))
-            result.append({**e, "filled": fr >= thresh})
-        return result
-
-    part_i_evals   = _apply_thresh(detection.get("raw_evals_i",   []), thresh1)
-    part_ii_evals  = _apply_thresh(detection.get("raw_evals_ii",  []), thresh2)
-    part_iii_evals = _apply_thresh(detection.get("raw_evals_iii", []), thresh3)
-
-    # Rebuild result image with fill overlay
-    result_image = detection["img"].copy()
-    all_evals = part_i_evals + part_ii_evals + part_iii_evals
-    if all_evals:
-        result_image = draw_filled_cells_overlay(result_image, all_evals, color=(0, 255, 0), alpha=0.35)
-
-    return {
-        "preprocess_mode":  detection["preprocess_mode"],
-        "data":             detection["data"],
-        "parts":            detection["parts"],
-        "sobao_danh":       detection["sobao_danh"],
-        "ma_de":            detection["ma_de"],
-        "split_x":          detection["split_x"],
-        "extrapolated":     detection["extrapolated"],
-        "sbd_digits":       detection["sbd_digits"],
-        "made_digits":      detection["made_digits"],
         "part_i_evals":     part_i_evals,
         "part_ii_evals":    part_ii_evals,
         "part_iii_evals":   part_iii_evals,
-        "parts_overlay":    detection["parts_overlay"],
-        "result_image":     result_image,
-        "binary_threshold": detection["binary_threshold"],
+        "parts_overlay":    overlay,
+        "result_image":     combined_grid_image,
+        "binary_threshold": binary_threshold,
     }
-
-
-def process_image(
-    image: np.ndarray,
-    fill_ratio_part1: float = 0.55,
-    fill_ratio_part2: float = 0.55,
-    fill_ratio_part3: float = 0.55,
-    debug_prefix: Optional[str] = None,
-    max_dim: int = 1600,
-) -> Dict[str, object]:
-    """Run the full OMR pipeline on a pre-loaded image and return all results.
-
-    This is the **primary entry point for the web UI** (``app.py``).
-    Internally calls :func:`detect_image` then :func:`grade_image`.
-    For batch processing with slider interactivity, call those two functions
-    separately and cache the :func:`detect_image` result.
-
-    Args:
-        image: Input BGR image as ``np.ndarray``.
-        fill_ratio_part1: Bubble fill threshold for Part I (multiple-choice).
-        fill_ratio_part2: Bubble fill threshold for Part II (true/false).
-        fill_ratio_part3: Bubble fill threshold for Part III (numeric).
-        debug_prefix: If set, intermediate debug images are written with this
-            path prefix.  ``None`` skips all disk I/O.
-        max_dim: Downscale longest dimension to this value (0 = disabled).
-
-    Returns:
-        Dict with the same keys as previously documented.
-    """
-    if image is None or image.size == 0:
-        raise ValueError("process_image() received an empty or None image array.")
-
-    detection = detect_image(image, max_dim=max_dim, debug_prefix=debug_prefix)
-    return grade_image(
-        detection,
-        fill_ratio_part1=fill_ratio_part1,
-        fill_ratio_part2=fill_ratio_part2,
-        fill_ratio_part3=fill_ratio_part3,
-    )

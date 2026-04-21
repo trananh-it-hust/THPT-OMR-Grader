@@ -2,28 +2,37 @@
 app.py — Streamlit web interface for the THPT OMR pipeline.
 
 Thin interface layer (ARCH_RULES L-2): all image processing is delegated to
-``src.pipeline.process_image()``.  This module contains only:
+``src.pipeline.detect_image()`` and ``src.pipeline.grade_image()``.
 
+Two-phase batch strategy (Windows-optimized):
+  Phase 1 — detect_image() runs in ProcessPoolExecutor (heavy CV work).
+             Results are cached in st.session_state by file signature.
+  Phase 2 — grade_image() runs instantly when sliders change; no CV re-run.
+
+This module contains only:
 - Streamlit UI configuration and layout.
 - ``_to_rgb()`` — display helper (BGR → RGB for st.image).
 - ``_build_structured_answers()`` — parse evals into answer dicts.
 - ``_build_json_payload()`` / ``_build_batch_summary_row()`` — data helpers.
 - ``_digit_eval_table()`` / ``_render_detailed_result()`` — UI rendering.
+- ``_worker_detect_single()`` — top-level worker for ProcessPoolExecutor.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import json
-import tempfile
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 import streamlit as st
+import multiprocessing
 
-from src.pipeline import process_image
+from src.pipeline import detect_image, grade_image
+from src.worker import detect_single as _worker_detect_single  # Windows-safe worker
 from src.log_config import logger
 
 
@@ -55,11 +64,11 @@ def _build_structured_answers(results: Dict[str, object], file_name: str = "") -
     """Extract structured per-question answers from raw cell evaluations.
 
     Parses ``part_i_evals``, ``part_ii_evals``, ``part_iii_evals``, and digit
-    results from ``results`` (as returned by :func:`process_image`) into
+    results from ``results`` (as returned by :func:`grade_image`) into
     answer dicts keyed by question number.
 
     Args:
-        results: Full result dict from ``process_image()``.
+        results: Full result dict from ``grade_image()``.
 
     Returns:
         Dict with keys:
@@ -141,7 +150,7 @@ def _build_structured_answers(results: Dict[str, object], file_name: str = "") -
 
     sbd = str(sbd_digits.get("decoded", ""))
     mdt = str(made_digits.get("decoded", ""))
-    
+
     if "?" in sbd:
         logger.warning(f"{prefix}Số Báo Danh chưa hoàn chỉnh/có lỗi: {sbd}")
     if "?" in mdt:
@@ -159,7 +168,7 @@ def _digit_eval_table(result: Dict[str, object]) -> List[Dict[str, object]]:
     """Build a display table from a digit-decode result dict.
 
     Args:
-        result: ``sbd_digits`` or ``made_digits`` from ``process_image()``.
+        result: ``sbd_digits`` or ``made_digits`` from ``grade_image()``.
 
     Returns:
         List of row dicts with keys ``Digit``, ``Column``, ``Filled``,
@@ -218,7 +227,7 @@ def _build_batch_summary_row(
     Args:
         file_name: Original uploaded filename.
         status: ``"OK"`` or ``"ERROR"``.
-        results: Result dict from ``process_image()`` (``None`` on error).
+        results: Result dict from ``grade_image()`` (``None`` on error).
         extracted: Dict from ``_build_structured_answers()`` (``None`` on error).
         error_message: Human-readable error string (empty on success).
 
@@ -248,47 +257,50 @@ def _build_batch_summary_row(
         "Error":      "",
     }
 
-def _worker_process_single(
-    name: str,
-    payload_type: str,
-    payload_data: object,
+
+# ---------------------------------------------------------------------------
+#  Phase 2 — grade (fast, no CV; uses cached detection)
+# ---------------------------------------------------------------------------
+
+def _grade_cached_batch(
+    detect_results: List[Dict[str, object]],
     f1: float,
     f2: float,
-    f3: float
-) -> Dict[str, object]:
-    """Top-level worker function for ProcessPoolExecutor to avoid pickling closures/huge matrices."""
-    import cv2
-    import numpy as np
+    f3: float,
+) -> List[Dict[str, object]]:
+    """Run grade_image on all detections and build summary rows."""
+    batch: List[Dict[str, object]] = []
+    for item in detect_results:
+        name = item["file_name"]
+        if item["status"] != "OK" or item["detection"] is None:
+            batch.append({
+                "file_name": name,
+                "status": "ERROR",
+                "error": item["error"],
+                "image": None,
+                "results": None,
+                "extracted": None,
+                "summary": _build_batch_summary_row(
+                    name, "ERROR", None, None, error_message=item["error"]
+                ),
+            })
+            continue
+        try:
+            results = grade_image(item["detection"], fill_ratio_part1=f1, fill_ratio_part2=f2, fill_ratio_part3=f3)
+            extracted = _build_structured_answers(results, file_name=name)
+            batch.append({
+                "file_name": name, "status": "OK", "error": "",
+                "image": item["image"], "results": results, "extracted": extracted,
+                "summary": _build_batch_summary_row(name, "OK", results, extracted),
+            })
+        except Exception as e:
+            batch.append({
+                "file_name": name, "status": "ERROR", "error": str(e),
+                "image": None, "results": None, "extracted": None,
+                "summary": _build_batch_summary_row(name, "ERROR", None, None, error_message=str(e)),
+            })
+    return batch
 
-    try:
-        # Decode image in the worker process individually
-        if payload_type == "path":
-            img = cv2.imread(str(payload_data))
-            if img is None:
-                raise ValueError(f"Không thể đọc ảnh từ {payload_data}")
-        elif payload_type == "bytes":
-            file_bytes = np.asarray(payload_data, dtype=np.uint8)
-            img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-            if img is None:
-                raise ValueError("Không thể decode ảnh upload")
-        elif payload_type == "error":
-            raise ValueError(str(payload_data))
-        else:
-            raise ValueError(f"Loại dữ liệu worker không hỗ trợ: {payload_type}")
-
-        results = process_image(img, fill_ratio_part1=f1, fill_ratio_part2=f2, fill_ratio_part3=f3, debug_prefix=None)
-        extracted = _build_structured_answers(results, file_name=name)
-        return {
-            "file_name": name, "status": "OK", "error": "",
-            "image": img, "results": results, "extracted": extracted,
-            "summary": _build_batch_summary_row(name, "OK", results, extracted)
-        }
-    except Exception as e:
-        return {
-            "file_name": name, "status": "ERROR", "error": str(e),
-            "image": None, "results": None, "extracted": None,
-            "summary": _build_batch_summary_row(name, "ERROR", None, None, error_message=str(e))
-        }
 
 # ---------------------------------------------------------------------------
 #  UI rendering
@@ -303,7 +315,7 @@ def _render_detailed_result(
     """Render the full per-image result panel in Streamlit.
 
     Args:
-        results: Result dict from ``process_image()``.
+        results: Result dict from ``grade_image()``.
         extracted: Dict from ``_build_structured_answers()``.
         debug_mode: If ``True``, additional debug panels are shown.
     """
@@ -459,226 +471,267 @@ def _render_detailed_result(
 #  Streamlit app entry point
 # ---------------------------------------------------------------------------
 
-st.set_page_config(
-    page_title="Nhận dạng phiếu trả lời",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.title("📊 Nhận dạng phiếu trả lời THPT Quốc gia")
-st.markdown("Tải lên ảnh phiếu để nhận dạng và trích xuất đáp án tự động.")
-
-# --- Sidebar configuration ---
-with st.sidebar:
-    st.header("⚙️ Cấu Hình")
-    debug_mode = st.checkbox("Chế Độ Debug", value=True)
-
-    st.markdown("---")
-    st.markdown("### Ngưỡng Fill Ratio")
-    fill_ratio_phan1 = st.slider("PHẦN I",   0.30, 0.95, 0.65, 0.01)
-    fill_ratio_phan2 = st.slider("PHẦN II",  0.30, 0.95, 0.65, 0.01)
-    fill_ratio_phan3 = st.slider("PHẦN III", 0.30, 0.95, 0.65, 0.01)
-
-    st.markdown("---")
-    st.caption(
-        "Luồng xử lý: detect box → group part → "
-        "decode SBD/Mã đề → grid fill ratio → trích xuất đáp án"
+import multiprocessing
+if multiprocessing.current_process().name == 'MainProcess':
+    st.set_page_config(
+        page_title="Nhận dạng phiếu trả lời",
+        page_icon="📊",
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
 
-# --- Input method ---
-col1, col2 = st.columns([1, 1], gap="medium")
+    st.title("📊 Nhận dạng phiếu trả lời THPT Quốc gia")
+    st.markdown("Tải lên ảnh phiếu để nhận dạng và trích xuất đáp án tự động.")
 
-with col1:
-    st.subheader("📤 Đầu Vào Hình Ảnh")
-    tab_files, tab_folder = st.tabs(["Tải Lên File", "Nhập Thư Mục (Gợi ý)"])
-    
-    with tab_files:
-        uploaded_files = st.file_uploader(
-            "Chọn 1 hoặc nhiều ảnh",
-            type=["jpg", "jpeg", "png", "bmp"],
-            accept_multiple_files=True,
+    # --- Sidebar configuration ---
+    with st.sidebar:
+        st.header("⚙️ Cấu Hình")
+        debug_mode = st.checkbox("Chế Độ Debug", value=True)
+
+        st.markdown("---")
+        st.markdown("### Ngưỡng Fill Ratio")
+        fill_ratio_phan1 = st.slider("PHẦN I",   0.30, 0.95, 0.65, 0.01)
+        fill_ratio_phan2 = st.slider("PHẦN II",  0.30, 0.95, 0.65, 0.01)
+        fill_ratio_phan3 = st.slider("PHẦN III", 0.30, 0.95, 0.65, 0.01)
+
+        st.markdown("---")
+        st.markdown("### Tốc Độ Xử Lý")
+        max_dim_options = {"Nguyên bản (Chính xác nhất)": 0}
+        max_dim_label = st.selectbox(
+            "Độ phân giải xử lý",
+            list(max_dim_options.keys()),
+            index=0,
+            help="Sử dụng độ phân giải gốc giúp thuật toán phát hiện ô được chính xác 100%.",
         )
-        process_clicked_upload = st.button(
-            "🚀 Bắt đầu xử lý (File)",
-            type="primary",
-            width="stretch",
-            disabled=not uploaded_files,
-            key="btn_upload"
-        )
-        
-    with tab_folder:
-        st.info("Khai báo thư mục chứa ảnh. Phương pháp này siêu nhanh vì bỏ qua bước upload của trình duyệt web.")
-        folder_path = st.text_input("Đường dẫn (ví dụ: PhieuQG/):", value="PhieuQG/")
-        process_clicked_folder = st.button(
-            "🚀 Bắt đầu quét thư mục",
-            type="primary",
-            width="stretch",
-            disabled=not folder_path,
-            key="btn_folder"
+        max_dim_val = max_dim_options[max_dim_label]
+
+        st.markdown("---")
+        st.caption(
+            "Luồng xử lý: detect box → group part → "
+            "decode SBD/Mã đề → grid fill ratio → trích xuất đáp án"
         )
 
-process_clicked = process_clicked_upload or process_clicked_folder
-mode = "folder" if process_clicked_folder else "upload"
+    # --- Input method ---
+    col1, col2 = st.columns([1, 1], gap="medium")
 
-# --- Session state: cache results to avoid reprocessing on slider changes ---
-_KEY_RESULTS   = "batch_results"
-_KEY_SIGNATURE = "batch_signature"
+    with col1:
+        st.subheader("📤 Đầu Vào Hình Ảnh")
+        tab_files, tab_folder = st.tabs(["Tải Lên File", "Nhập Thư Mục (Gợi ý)"])
 
-if _KEY_RESULTS not in st.session_state:
-    st.session_state[_KEY_RESULTS] = []
-if _KEY_SIGNATURE not in st.session_state:
-    st.session_state[_KEY_SIGNATURE] = ()
+        with tab_files:
+            uploaded_files = st.file_uploader(
+                "Chọn 1 hoặc nhiều ảnh",
+                type=["jpg", "jpeg", "png", "bmp"],
+                accept_multiple_files=True,
+            )
+            process_clicked_upload = st.button(
+                "🚀 Bắt đầu xử lý (File)",
+                type="primary",
+                width="stretch",
+                disabled=not uploaded_files,
+                key="btn_upload"
+            )
 
-import time
-if "batch_sig_val" not in st.session_state:
-    st.session_state["batch_sig_val"] = ()
+        with tab_folder:
+            st.info("Khai báo thư mục chứa ảnh. Phương pháp này siêu nhanh vì bỏ qua bước upload của trình duyệt web.")
+            folder_path = st.text_input("Đường dẫn (ví dụ: PhieuQG/):", value="PhieuQG/")
+            process_clicked_folder = st.button(
+                "🚀 Bắt đầu quét thư mục",
+                type="primary",
+                width="stretch",
+                disabled=not folder_path,
+                key="btn_folder"
+            )
 
-current_signature: Tuple[object, ...] = ()
-if mode == "upload" and uploaded_files:
-    current_signature = tuple((f.name, int(getattr(f, "size", 0))) for f in uploaded_files)
-    st.session_state["batch_sig_val"] = current_signature
-elif mode == "folder" and folder_path:
-    if process_clicked_folder:
-        st.session_state["batch_sig_val"] = (folder_path, time.time())
-    current_signature = st.session_state["batch_sig_val"]
+    process_clicked = process_clicked_upload or process_clicked_folder
+    mode = "folder" if process_clicked_folder else "upload"
 
-# --- Batch processing ---
-if process_clicked:
-    progress_bar = st.progress(0)
-    status_text  = st.empty()
+    # --- Session state keys ---
+    _KEY_DETECTIONS = "batch_detections"   # List[Dict] — Phase 1 cache (detection results)
+    _KEY_SIGNATURE  = "batch_signature"    # Tuple — identifies current file set
+    _KEY_MAX_DIM    = "batch_max_dim"      # int — max_dim used for detections
 
-    batch_results: List[Dict[str, object]] = []
-    tasks = []
+    for k, v in [(_KEY_DETECTIONS, []), (_KEY_SIGNATURE, ()), (_KEY_MAX_DIM, -1)]:
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    # 1. Gather tasks as lightweight payloads (avoid pickling gigantic active numpy arrays)
-    if mode == "folder" and folder_path:
-        folder = Path(folder_path)
-        if folder.exists() and folder.is_dir():
-            for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
-                for p in folder.glob(ext):
-                    # We pass the absolute Path object directly
-                    tasks.append((p.name, "path", str(p)))
-        else:
-            st.error(f"Thư mục không tồn tại: {folder_path}")
-            
-    elif mode == "upload" and uploaded_files:
-        for uploaded in uploaded_files:
-            try:
-                raw_bytes = bytearray(uploaded.getvalue())
-                tasks.append((uploaded.name, "bytes", raw_bytes))
-            except Exception as err:
-                tasks.append((uploaded.name, "error", str(err)))
-                
-    total_files = len(tasks)
+    if "batch_sig_val" not in st.session_state:
+        st.session_state["batch_sig_val"] = ()
 
-    # 2. Process concurrently avoiding the GIL via ProcessPoolExecutor
-    processed_count = 0
-    import multiprocessing
-    max_workers = max(1, min(12, multiprocessing.cpu_count() - 1))
-    
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        future_to_name = {
-            executor.submit(_worker_process_single, t[0], t[1], t[2], fill_ratio_phan1, fill_ratio_phan2, fill_ratio_phan3): t[0]
-            for t in tasks
-        }
-        for future in concurrent.futures.as_completed(future_to_name):
-            processed_count += 1
-            fname = future_to_name[future]
-            status_text.text(f"Đang xử lý {processed_count}/{total_files}: {fname}")
-            progress_bar.progress(int((processed_count / max(1, total_files)) * 100))
-            try:
-                batch_results.append(future.result())
-            except Exception as e:
-                pass # Handled internally by _worker_process_single
+    # Build current signature
+    current_signature: Tuple[object, ...] = ()
+    if mode == "upload" and uploaded_files:
+        current_signature = tuple((f.name, int(getattr(f, "size", 0))) for f in uploaded_files)
+        st.session_state["batch_sig_val"] = current_signature
+    elif mode == "folder" and folder_path:
+        if process_clicked_folder:
+            st.session_state["batch_sig_val"] = (folder_path, time.time())
+        current_signature = st.session_state["batch_sig_val"]
 
-    if total_files > 0:
-        progress_bar.progress(100)
-        status_text.text(f"Hoàn thành xử lý {total_files} ảnh")
-        
-        if mode == "upload":
-            original_order = {f.name: i for i, f in enumerate(uploaded_files)}
-            batch_results.sort(key=lambda x: original_order.get(str(x["file_name"]), 0))
-        else:
-            batch_results.sort(key=lambda x: str(x["file_name"]))
-            
-        st.session_state[_KEY_RESULTS]   = batch_results
-        st.session_state[_KEY_SIGNATURE] = current_signature
-
-# --- Display batch results ---
-has_batch_results = (
-    (bool(uploaded_files) or (mode == "folder" and bool(folder_path)))
-    and bool(st.session_state[_KEY_RESULTS])
-    and st.session_state[_KEY_SIGNATURE] == current_signature
-)
-
-if has_batch_results:
-    batch_results = st.session_state[_KEY_RESULTS]
-    success_items = [item for item in batch_results if item["status"] == "OK"]
-    error_items   = [item for item in batch_results if item["status"] != "OK"]
-
-    st.markdown("---")
-    st.subheader("📋 Kết Quả Tổng Hợp")
-
-    m1, m2, m3 = st.columns(3)
-    with m1: st.metric("Tổng số ảnh",  len(batch_results))
-    with m2: st.metric("Thành công",   len(success_items))
-    with m3: st.metric("Lỗi",          len(error_items))
-
-    st.dataframe([item["summary"] for item in batch_results], width="stretch")
-
-    # JSON download
-    combined_payload = []
-    for item in success_items:
-        payload = _build_json_payload(item["extracted"])
-        payload["file_name"] = item["file_name"]
-        combined_payload.append(payload)
-
-    st.download_button(
-        label="⬇️ Tải JSON tổng hợp",
-        data=json.dumps(combined_payload, indent=2, ensure_ascii=False),
-        file_name="ket_qua_tong_hop.json",
-        mime="application/json",
-        width="stretch",
-        disabled=not combined_payload,
+    # Detect if we need to rerun Phase 1 (signature changed or max_dim changed)
+    _detections_valid = (
+        bool(st.session_state[_KEY_DETECTIONS])
+        and st.session_state[_KEY_SIGNATURE] == current_signature
+        and st.session_state[_KEY_MAX_DIM] == max_dim_val
     )
 
-    # Per-image detail view
-    if success_items:
-        selected_file_name = st.selectbox(
-            "Chọn ảnh để xem chi tiết",
-            options=[item["file_name"] for item in success_items],
+    # --- Phase 1: Batch detection (heavy CV — only runs when file set changes) ---
+    if process_clicked or (not _detections_valid and bool(current_signature) and st.session_state[_KEY_DETECTIONS]):
+        # Build task list
+        tasks = []
+        if mode == "folder" and folder_path:
+            folder = Path(folder_path)
+            if folder.exists() and folder.is_dir():
+                for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
+                    for p in sorted(folder.glob(ext)):
+                        tasks.append((p.name, "path", str(p)))
+            else:
+                st.error(f"Thư mục không tồn tại: {folder_path}")
+        elif mode == "upload" and uploaded_files:
+            for uploaded in uploaded_files:
+                try:
+                    raw_bytes = bytearray(uploaded.getvalue())
+                    tasks.append((uploaded.name, "bytes", raw_bytes))
+                except Exception as err:
+                    tasks.append((uploaded.name, "error", str(err)))
+
+        total_files = len(tasks)
+        if total_files > 0:
+            progress_bar = st.progress(0)
+            status_text  = st.empty()
+            t_start = time.time()
+
+            detect_results: List[Dict[str, object]] = []
+            processed_count = 0
+
+            max_workers = max(1, min(8, multiprocessing.cpu_count() - 1))
+
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                future_to_name = {
+                    executor.submit(_worker_detect_single, t[0], t[1], t[2], max_dim_val): t[0]
+                    for t in tasks
+                }
+                for future in concurrent.futures.as_completed(future_to_name):
+                    processed_count += 1
+                    fname = future_to_name[future]
+                    elapsed = time.time() - t_start
+                    per_img = elapsed / processed_count
+                    remaining = (total_files - processed_count) * per_img
+                    eta_str = f"  ETA ~{remaining:.0f}s" if processed_count < total_files else ""
+                    status_text.text(
+                        f"[Phase 1] Phát hiện {processed_count}/{total_files}: {fname}{eta_str}"
+                    )
+                    progress_bar.progress(int((processed_count / max(1, total_files)) * 100))
+                    try:
+                        detect_results.append(future.result())
+                    except Exception as e:
+                        detect_results.append({
+                            "file_name": fname, "status": "ERROR",
+                            "error": str(e), "detection": None, "image": None,
+                        })
+
+            # Sort order
+            if mode == "upload":
+                original_order = {f.name: i for i, f in enumerate(uploaded_files)}
+                detect_results.sort(key=lambda x: original_order.get(str(x["file_name"]), 0))
+            else:
+                detect_results.sort(key=lambda x: str(x["file_name"]))
+
+            # Cache Phase 1 results
+            st.session_state[_KEY_DETECTIONS] = detect_results
+            st.session_state[_KEY_SIGNATURE]  = current_signature
+            st.session_state[_KEY_MAX_DIM]    = max_dim_val
+
+            elapsed_total = time.time() - t_start
+            status_text.text(
+                f"✅ Phase 1 hoàn thành: {total_files} ảnh trong {elapsed_total:.1f}s "
+                f"({elapsed_total/max(1,total_files):.1f}s/ảnh)"
+            )
+            progress_bar.progress(100)
+
+    # --- Phase 2: Grade with current fill_ratio (fast, always re-runs on slider change) ---
+    has_detections = (
+        bool(st.session_state[_KEY_DETECTIONS])
+        and st.session_state[_KEY_SIGNATURE] == current_signature
+    )
+
+    if has_detections:
+        detect_results = st.session_state[_KEY_DETECTIONS]
+
+        # Re-grade instantly with current sliders
+        batch_results = _grade_cached_batch(
+            detect_results,
+            f1=fill_ratio_phan1,
+            f2=fill_ratio_phan2,
+            f3=fill_ratio_phan3,
         )
-        selected_item = next(item for item in success_items if item["file_name"] == selected_file_name)
 
-        with col1:
-            st.subheader("📸 Hình Ảnh Gốc")
-            st.image(_to_rgb(selected_item["image"]), width="stretch")
+        success_items = [item for item in batch_results if item["status"] == "OK"]
+        error_items   = [item for item in batch_results if item["status"] != "OK"]
 
-        with col2:
-            st.subheader("📊 Kết Quả Phân Tích")
-            st.image(_to_rgb(selected_item["results"]["result_image"]), width="stretch")
+        st.markdown("---")
+        st.subheader("📋 Kết Quả Tổng Hợp")
+        m1, m2, m3, m4 = st.columns(4)
+        with m1: st.metric("Tổng số ảnh",  len(batch_results))
+        with m2: st.metric("Thành công",   len(success_items))
+        with m3: st.metric("Lỗi",          len(error_items))
+        with m4: st.metric("Ngưỡng P1/P2/P3", f"{fill_ratio_phan1:.2f}/{fill_ratio_phan2:.2f}/{fill_ratio_phan3:.2f}")
 
-        _render_detailed_result(
-            selected_item["results"],
-            selected_item["extracted"],
-            debug_mode=debug_mode,
+        st.dataframe([item["summary"] for item in batch_results], width="stretch")
+
+        # JSON download
+        combined_payload = []
+        for item in success_items:
+            payload = _build_json_payload(item["extracted"])
+            payload["file_name"] = item["file_name"]
+            combined_payload.append(payload)
+
+        st.download_button(
+            label="⬇️ Tải JSON tổng hợp",
+            data=json.dumps(combined_payload, indent=2, ensure_ascii=False),
+            file_name="ket_qua_tong_hop.json",
+            mime="application/json",
+            width="stretch",
+            disabled=not combined_payload,
         )
+
+        # Per-image detail view
+        if success_items:
+            selected_file_name = st.selectbox(
+                "Chọn ảnh để xem chi tiết",
+                options=[item["file_name"] for item in success_items],
+            )
+            selected_item = next(item for item in success_items if item["file_name"] == selected_file_name)
+
+            with col1:
+                st.subheader("📸 Hình Ảnh Gốc")
+                st.image(_to_rgb(selected_item["image"]), width="stretch")
+
+            with col2:
+                st.subheader("📊 Kết Quả Phân Tích")
+                st.image(_to_rgb(selected_item["results"]["result_image"]), width="stretch")
+
+            _render_detailed_result(
+                selected_item["results"],
+                selected_item["extracted"],
+                debug_mode=debug_mode,
+            )
+        else:
+            st.error("Không có ảnh nào xử lý thành công để hiển thị chi tiết.")
+
+    elif uploaded_files:
+        st.info("Nhấn '🚀 Bắt đầu xử lý' để chạy batch và xem tiến độ/kết quả tổng hợp.")
     else:
-        st.error("Không có ảnh nào xử lý thành công để hiển thị chi tiết.")
-
-elif uploaded_files:
-    st.info("Nhấn '🚀 Bắt đầu xử lý' để chạy batch và xem tiến độ/kết quả tổng hợp.")
-else:
-    st.info("👆 Tải lên một hình ảnh để bắt đầu")
-    st.markdown("---")
-    st.subheader("📖 Cách sử dụng")
-    st.markdown(
-        """
-        1. Tải lên một hoặc nhiều ảnh phiếu trả lời.
-        2. Chỉnh ngưỡng fill ratio ở thanh bên nếu cần.
-        3. Nhấn nút xử lý để theo dõi tiến độ batch.
-        4. Xem bảng tổng hợp và chọn từng ảnh để xem chi tiết.
-        5. Bật Debug để xem thêm thông tin nội bộ của pipeline.
-        """
-    )
+        st.info("👆 Tải lên một hình ảnh để bắt đầu")
+        st.markdown("---")
+        st.subheader("📖 Cách sử dụng")
+        st.markdown(
+            """
+            1. Tải lên một hoặc nhiều ảnh phiếu trả lời.
+            2. Chọn **Độ phân giải xử lý** phù hợp (Nhanh = 1200px cho hầu hết ảnh scan).
+            3. Nhấn nút xử lý — **Phase 1** phát hiện bố cục ảnh (chạy 1 lần).
+            4. Kéo slider **Ngưỡng Fill Ratio** để điều chỉnh — cập nhật tức thì, không cần xử lý lại.
+            5. Xem bảng tổng hợp và chọn từng ảnh để xem chi tiết.
+            6. Bật **Debug** để xem thêm thông tin nội bộ của pipeline.
+            """
+        )

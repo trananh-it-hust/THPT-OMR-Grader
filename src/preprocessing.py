@@ -89,3 +89,30 @@ def preprocess_clahe(image: np.ndarray) -> np.ndarray:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l_enhanced = clahe.apply(l_ch)
     return cv2.cvtColor(cv2.merge([l_enhanced, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+
+
+def resize_for_processing(image: np.ndarray, max_dim: int = 1600) -> np.ndarray:
+    """Downscale image so the longest side ≤ *max_dim*, preserving aspect ratio.
+
+    The entire pipeline is scale-invariant (all thresholds are expressed as
+    fractions of image dimensions), so grading accuracy is unaffected.
+    Reduces CPU time for morphology, Hough, and fill-ratio by ~(scale)².
+
+    Args:
+        image: Input BGR image.
+        max_dim: Maximum allowed length of either dimension. Images already
+            within this limit are returned unchanged (no copy).
+
+    Returns:
+        Possibly down-scaled BGR image as ``np.ndarray``.
+    """
+    if image is None or image.size == 0:
+        return image
+    h, w = image.shape[:2]
+    longest = max(h, w)
+    if longest <= max_dim:
+        return image
+    scale = float(max_dim) / float(longest)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)

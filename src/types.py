@@ -10,10 +10,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-
-# ---------------------------------------------------------------------------
-# Type aliases
-# ---------------------------------------------------------------------------
+------------------------------------------------------------------
 
 Contour = np.ndarray
 """A single OpenCV contour, shape (N, 1, 2), dtype int32."""
@@ -24,13 +21,7 @@ BoundingRect = Tuple[int, int, int, int]
 Point2D = Tuple[float, float]
 """A 2-D point as ``(x, y)``."""
 
-# ---------------------------------------------------------------------------
-# NOTE: We use plain dictionaries (as the original code does) rather than
-# TypedDict for now, so that all existing dict-returning functions remain
-# compatible without any change.  The type aliases below document the
-# *expected* keys for each dictionary kind and serve as reference contracts.
-# A future PR can migrate to strict TypedDict enforcement.
-# ---------------------------------------------------------------------------
+
 
 # BoxInfo keys: "box", "x", "y", "w", "h", "center_y", "area"
 BoxInfoKeys = Dict[str, object]

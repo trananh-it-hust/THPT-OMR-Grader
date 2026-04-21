@@ -51,13 +51,63 @@ Toàn bộ luồng mã nguồn chạy qua 5 bước chính như một nhà máy 
 
 ---
 
-## 3. TẠI SAO GIẢI PHÁP NÀY LẠI TỐI ƯU HƠN CÁC PHƯƠNG PHÁP KHÁC? (DÀNH CHO BẢO VỆ ĐỒ ÁN)
+## 4. CHI TIẾT Ý NGHĨA CÁC HÀM CỐT LÕI (CORE FUNCTIONS)
 
-**1. Tại sao không dùng YOLO / Deep Learning để dò khung?**
-* Trả lời: Form chấm thi quy chuẩn của Bộ GDĐT mang tính cấu trúc hình học cực kỳ nghiêm ngặt và không đổi (tọa độ các ô, khoảng cách viền...). Dùng AI cho bài toán này là việc "lấy dao mổ trâu giết gà", AI sẽ đòi hỏi máy chủ tốn chi phí đắt đỏ (GPU), xử lý chậm và tốn dữ liệu huấn luyện khổng lồ. Cách dùng Mathematics / Morphology hiện hành xử lý nháy mắt trên 1 CPU lõi đơn bé nhất, không cần Card đồ họa, mà độ chính xác gần như 100%.
+Dưới đây là các "mắt xích" quan trọng trong mã nguồn mà em cần nắm vững khi bảo vệ đồ án:
 
-**2. Điều gì cứu vãn các phiếu méo, xoay, hoặc mờ?**
-* Trả lời: Trong dự án được trang bị cơ chế nhận diện 4 điểm neo đen (Corner markers) ở 4 góc giấy. Nhờ thuật toán **Affine Perspective Transform**, khi tờ giấy bị cong méo do đặt vào máy Scan xộc xệch, code sẽ tính toán ma trận ma thuật kéo nắn ảnh thẳng băng trở lại trước khi chấm. Đồng thời màng lọc CLAHE liên tục bù sáng cho các file tối.
+### A. Nhóm Xử lý Ảnh & Hình thái học (Morphology)
+*   **`detect_boxes_from_morph_lines`**: Hàm thực hiện quét ảnh để tìm các đường kẻ. Nó sử dụng `cv2.getStructuringElement` để tạo các "thanh thước kẻ" dọc và ngang, sau đó dùng toán tử `bitwise_and` để tìm giao điểm. Đây là bước quan trọng nhất để xác định lưới tọa độ.
+*   **`detect_black_corner_markers`**: Tìm 4 điểm đen ở góc giấy. Ý nghĩa là để xác định khung tham chiếu (Reference frame), giúp hệ thống biết tờ giấy đang bị xoay hay méo bao nhiêu độ.
+*   **`preprocess_clahe`**: Cân bằng ánh sáng cục bộ. Nó giúp xử lý các ảnh bị bóng đổ (ví dụ học sinh chụp ảnh bằng điện thoại thường bị bóng của chính mình che mất một góc phiếu).
 
-**3. Khả năng bảo trì và nâng cấp của dự án**
-* Trả lời: Hệ thống chia luồng rất rõ ràng. Toàn bộ các hệ số (to nhỏ, nhạy cảm sáng tối) được tách bóc hoàn toàn sang một file `config.py`. Ngày mai nếu Bộ GD&ĐT quyết định đổi kích cỡ tờ giấy từ A4 sang A5, người dùng không cần biết code, chỉ cần vào file text config sửa lại một vài tỉ lệ số học là hệ thống chạy tiếp ngay.
+### B. Nhóm Tư duy Bố cục (Grouping & Segmentation)
+*   **`group_boxes_into_parts`**: Dựa vào danh sách hàng trăm box tìm được, hàm này dùng logic khoảng cách (Spatial grouping) để gom chúng thành 3 cụm: Phần I, II, và III. Nó là bộ não giúp máy tính không bị "loạn" giữa hàng tá ô vuông.
+*   **`separate_upper_id_boxes`**: Sử dụng tọa độ X của Phần I làm chuẩn để chia đôi vùng phía trên thành 2 cột: Cột bên trái mặc định là Số báo danh (SBD), cột bên phải là Mã đề.
+
+### C. Nhóm Giải mã & Chấm điểm (Decoding & Grading)
+*   **`evaluate_digit_rows_mean_darkness`**: Đây là kỹ thuật "Mean-Darkness". Thay vì nhận diện hình ảnh, nó đo mật độ pixel (density) trong các ô SBD/Mã đề. Nó so sánh độ đen của ô được tô với các ô còn lại trong cùng một cột để đưa ra kết quả. Nếu độ chênh lệch (gap) quá thấp, nó sẽ báo lỗi `?`.
+*   **`evaluate_grid_fill_from_binary`**: Chấm điểm các câu trắc nghiệm. Nó sử dụng một "Circular Mask" (màng lọc hình tròn) để chỉ đếm vết chì bên trong vòng tròn đáp án, loại bỏ hoàn toàn nhiễu từ các đường kẻ khung quanh ô.
+*   **`extrapolate_missing_rows`**: Hàm ngoại suy. Nếu một hàng bị mờ đến mức máy không tìm thấy box, hàm này sẽ lấy tọa độ của các hàng trên/dưới để "dựng lại" hàng bị mất, đảm bảo không bỏ sót câu trả lời nào.
+
+---
+
+## 5. CẤU TRÚC GIAO DIỆN WEB (STREAMLIT UI)
+
+Giao diện được thiết kế theo hướng thực dụng, giúp giáo viên điều khiển thuật toán một cách trực quan:
+
+1.  **Sidebar (Thanh cấu hình bên trái):**
+    *   **Ngưỡng Fill Ratio (Threshold sliders):** Đây là "nút vặn" độ nhạy. Em có thể kéo để thay đổi mức độ ghi nhận một ô là "đã tô". Tính năng này cực kỳ hữu ích vì mỗi loại bút chì (2B, HB) hoặc lực tô của học sinh là khác nhau.
+    *   **Chế độ Debug:** Khi bật, hệ thống sẽ trưng bày các ảnh nội bộ (Binary mask, Detected boxes). Đây là công cụ phục vụ việc kiểm thử (Testing) và minh oan khi có phản ánh chấm sai.
+2.  **Bảng Kết Quả Tổng Hợp (Batch Gallery):** Hiển thị danh sách tất cả các ảnh đã xử lý. Giáo viên có thể nhìn nhanh các cột "SBD", "Mã đề", "Số câu đã làm" để phát hiện các phiếu lỗi (Status: ERROR) mà không cần mở từng ảnh.
+3.  **Khu vực Chi tiết (Detailed View):**
+    *   **Tabs (SBD, Mã đề, Phần I/II/III):** Phân loại dữ liệu rõ ràng. Mỗi tab sử dụng các thẻ **Metric** (con số lớn) để hiển thị đáp án đã trích xuất.
+    *   **JSON Tab:** Hiển thị dữ liệu thô dưới dạng mã máy. Đây chính là thứ mà chúng ta sẽ lưu vào server hoặc đẩy vào file Excel điểm số.
+4.  **Hệ thống Overlay (Vẽ đè):** Máy sẽ vẽ các vòng tròn xanh lá cây trực tiếp lên ảnh gốc để giáo viên đối soát. Nếu máy chấm câu A mà ảnh học sinh tô câu B, giáo viên sẽ thấy ngay sự lệch lạc này.
+
+---
+
+## 6. Ý NGHĨA KẾT QUẢ JSON (OUTPUT DATA)
+
+File JSON là sản phẩm cuối cùng của hệ thống. Hiểu cấu trúc này là chìa khóa để kết nối với các hệ thống quản lý điểm:
+
+```json
+{
+  "res": {
+    "fc": { "1": [0], "2": [1, 2] }, // "fc" = Full Choice (Phần I). Câu 1 chọn A (0), Câu 2 chọn B và C (lỗi tô 2 ô).
+    "fc_invalid": ["2"],            // Danh sách các câu bị lỗi ở Phần I.
+    "tf": { "1": [1] },              // "tf" = True/False (Phần II). 0: Sai, 1: Đúng.
+    "dg": { "1": "123" },            // "dg" = Digits (Phần III). Đáp án tự luận là 123.
+    "sbd": "012345",                 // 6 chữ số Số báo danh.
+    "mdt": "101",                    // 3 chữ số Mã đề.
+    "sbd_invalid": false,            // Nếu là true, nghĩa là hệ thống không tự tin vào kết quả SBD (cần kiểm tra tay).
+    "mdt_invalid": false
+  }
+}
+```
+*   **Tính toàn vẹn (Integrity):** Mọi câu hỏi đều có mặt trong JSON dù thí sinh có làm hay không (nếu không làm sẽ trả về danh sách trống `[]`).
+*   **Hỗ trợ chấm phúc khảo:** Toàn bộ lịch sử "quyết định" của máy (ví dụ độ đen bao nhiêu, tọa độ nào) đều có thể được truy xuất lại từ các metadata đi kèm (không hiện hết trong JSON rút gọn nhưng có trong bộ nhớ cache).
+
+---
+
+## 7. KẾT LUẬN
+Dự án này không đơn thuần là "nhận diện hình ảnh", mà là một hệ thống **Xử lý luồng dữ liệu (Data Pipeline)**: biến các nguyên tử pixel thành các bit dữ liệu có ý nghĩa. Với một sinh viên năm 3, việc hiểu rõ các hàm `morphology` và `grouping` trong dự án này sẽ giúp em có nền tảng cực tốt về tư duy thuật toán thực tế.

@@ -192,8 +192,8 @@ def _detect_single_circle_hough_in_quad(
         return _circle_iou(ca, cb) >= 0.35
 
     candidates: List[Dict[str, float]] = []
-    # Reduced from 6 combinations (dp/param2) down to 2 for 3x speedup without accuracy loss
-    for param2 in (14, 11):
+    # Restore original combinations for maximum robustness
+    for param2 in (14, 11, 8):
         circles = cv2.HoughCircles(
             prep, cv2.HOUGH_GRADIENT, dp=1.1, minDist=float(min_dist),
             param1=80, param2=param2, minRadius=min_r, maxRadius=max_r,

@@ -69,10 +69,10 @@ def evaluate_digit_rows_mean_darkness(
     expected_cols: int,
     radius_scale: float = 0.36,
     abs_darkness_threshold: float = 195.0,
-    min_second_gap: float = 8.0,
-    min_median_gap: float = 12.0,
-    min_abs_median_gap: float = 5.0,
-    min_abs_second_gap: float = 5.0,
+    min_second_gap: float = 6.0,
+    min_median_gap: float = 8.0,
+    min_abs_median_gap: float = 3.0,
+    min_abs_second_gap: float = 3.0,
 ) -> Dict[str, object]:
     """Decode one digit per column via mean-darkness comparison.
 
@@ -133,7 +133,10 @@ def evaluate_digit_rows_mean_darkness(
             second_dark = float(sorted_items[1]["mean_darkness"]) if len(sorted_items) > 1 else 255.0
             median_dark = float(np.median([float(it["mean_darkness"]) for it in sorted_items]))
 
-            has_abs_dark = best_dark <= float(abs_darkness_threshold)
+            dynamic_thresh = max(175.0, median_dark - 10.0)
+            # If a bubble is extremely dark (absolute), we trust it.
+            very_strong_abs = best_dark <= 165.0
+            has_abs_dark = best_dark <= float(abs_darkness_threshold) or best_dark <= dynamic_thresh
             second_gap = second_dark - best_dark
             median_gap = median_dark - best_dark
             has_gap = second_gap >= float(min_second_gap) and median_gap >= float(min_median_gap)
@@ -141,7 +144,7 @@ def evaluate_digit_rows_mean_darkness(
                 median_gap >= float(min_abs_median_gap)
                 and second_gap >= float(min_abs_second_gap)
             )
-            col_filled = bool(has_gap or (has_abs_dark and has_context_for_abs))
+            col_filled = bool(has_gap or (has_abs_dark and has_context_for_abs) or very_strong_abs)
 
             if col_filled:
                 best_item["filled"] = True
