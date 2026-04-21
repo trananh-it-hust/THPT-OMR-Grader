@@ -31,6 +31,7 @@ from src.box_grouping import (
     _rect_to_poly,
     _build_synthetic_id_rows_from_part_i,
     _build_synthetic_id_rows_fixed_image_position,
+    _build_synthetic_id_rows_anchored,
     _apply_affine_from_corner_markers,
 )
 from src.grid_extraction import (
@@ -692,12 +693,12 @@ def detect_image(
         remaining_boxes, split_wide=True, split_tall=False,
     )
     sbd_candidates, ma_de_candidates, split_x = _separate_upper_id_boxes(
-        remaining_for_upper, parts["part_i"],
+        remaining_for_upper, parts["part_i"], image_shape=img.shape[:2]
     )
 
     sobao_danh = detect_sobao_danh_boxes(
         sbd_candidates, boxes_per_row=6, max_rows=10,
-        row_tolerance=45, size_tolerance_ratio=0.45, debug=False,
+        row_tolerance=25, size_tolerance_ratio=0.45, debug=False,
     )
 
     remaining_for_ma_de = _split_merged_boxes_for_grouping(
@@ -705,7 +706,7 @@ def detect_image(
     )
     ma_de = detect_ma_de_boxes(
         remaining_for_ma_de, boxes_per_row=3, max_rows=10,
-        row_tolerance=35, size_tolerance_ratio=0.40, debug=False,
+        row_tolerance=20, size_tolerance_ratio=0.40, debug=False,
     )
 
     # ------------------------------------------------------------------
@@ -733,18 +734,18 @@ def detect_image(
                 remaining_boxes_affine, split_wide=True, split_tall=False,
             )
             sbd_candidates_affine, ma_de_candidates_affine, split_x_affine = (
-                _separate_upper_id_boxes(remaining_for_upper_affine, parts_affine["part_i"])
+                _separate_upper_id_boxes(remaining_for_upper_affine, parts_affine["part_i"], image_shape=affine_img.shape[:2])
             )
             sobao_danh_affine = detect_sobao_danh_boxes(
                 sbd_candidates_affine, boxes_per_row=6, max_rows=10,
-                row_tolerance=45, size_tolerance_ratio=0.45, debug=False,
+                row_tolerance=25, size_tolerance_ratio=0.45, debug=False,
             )
             remaining_for_ma_de_affine = _split_merged_boxes_for_grouping(
                 ma_de_candidates_affine, split_wide=False, split_tall=True,
             )
             ma_de_affine = detect_ma_de_boxes(
                 remaining_for_ma_de_affine, boxes_per_row=3, max_rows=10,
-                row_tolerance=35, size_tolerance_ratio=0.40, debug=False,
+                row_tolerance=20, size_tolerance_ratio=0.40, debug=False,
             )
 
             old_score = int(sobao_danh["row_count"]) + int(ma_de["row_count"])
@@ -761,13 +762,18 @@ def detect_image(
     # ------------------------------------------------------------------
     # 2.1 Synthetic fallback for severely misaligned/faint SBD/MDT
     # ------------------------------------------------------------------
+    # Nếu pipeline detect được ≥1 hàng, dùng vị trí thực của hàng đó để
+    # đặt lưới (anchored). Nếu không có hàng nào, dùng hằng số cứng.
     id_fallback_row_threshold = 4
     if sobao_danh["row_count"] <= id_fallback_row_threshold:
-        sobao_rows_synth = _build_synthetic_id_rows_fixed_image_position(
-            image_shape=img.shape[:2], cols=6, rows=10,
-            x_range_ratio=(0.745, 0.865),
-            top_y_ratio=0.072,
-            row_step_ratio=0.021,
+        sobao_rows_synth = _build_synthetic_id_rows_anchored(
+            image_shape=img.shape[:2],
+            detected_rows=sobao_danh["sobao_danh_rows"],
+            cols=6,
+            rows=10,
+            fallback_x_range=(0.745, 0.865),
+            fallback_top_y_ratio=0.072,
+            fallback_step_ratio=0.021,
         )
         if sobao_rows_synth:
             sobao_danh["sobao_danh_rows"] = sobao_rows_synth
@@ -775,11 +781,14 @@ def detect_image(
             sobao_danh["row_count"] = len(sobao_rows_synth)
 
     if ma_de["row_count"] <= id_fallback_row_threshold:
-        ma_de_rows_synth = _build_synthetic_id_rows_fixed_image_position(
-            image_shape=img.shape[:2], cols=3, rows=10,
-            x_range_ratio=(0.90, 0.96),
-            top_y_ratio=0.072,
-            row_step_ratio=0.021,
+        ma_de_rows_synth = _build_synthetic_id_rows_anchored(
+            image_shape=img.shape[:2],
+            detected_rows=ma_de["ma_de_rows"],
+            cols=3,
+            rows=10,
+            fallback_x_range=(0.90, 0.96),
+            fallback_top_y_ratio=0.072,
+            fallback_step_ratio=0.021,
         )
         if ma_de_rows_synth:
             ma_de["ma_de_rows"] = ma_de_rows_synth

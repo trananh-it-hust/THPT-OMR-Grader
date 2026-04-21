@@ -297,6 +297,7 @@ def _split_merged_boxes_for_grouping(
 def _separate_upper_id_boxes(
     boxes: List[np.ndarray],
     part_i_boxes: List[np.ndarray],
+    image_shape: Optional[Tuple[int, int]] = None,
     top_margin: int = 10,
     min_area: int = 350,
     max_area: int = 6000,
@@ -324,14 +325,18 @@ def _separate_upper_id_boxes(
 
     part_i_top = min(cv2.boundingRect(b)[1] for b in part_i_boxes)
     y_limit = part_i_top - top_margin
+    page_w = image_shape[1] if image_shape else 1.0
+    x_limit = page_w * 0.45 if image_shape else 0.0
 
     upper_items: List[Tuple[np.ndarray, float, float]] = []
     for box in boxes:
         x, y, w, h = cv2.boundingRect(box)
         area = w * h
-        if y < y_limit and min_area <= area <= max_area:
-            cx = x + (w / 2.0)
-            cy = y + (h / 2.0)
+        cx = x + (w / 2.0)
+        cy = y + (h / 2.0)
+        
+        # Lọc bỏ các box nằm quá xa bên trái (vùng tên, ghi chú) hoặc quá thấp
+        if y < y_limit and min_area <= area <= max_area and cx > x_limit:
             upper_items.append((box, cx, cy))
 
     if not upper_items:
@@ -1737,6 +1742,127 @@ def _build_synthetic_id_rows_fixed_image_position(
         out_rows.append(row_boxes)
 
     return out_rows
+
+
+def _build_synthetic_id_rows_anchored(
+    image_shape: Tuple[int, int],
+    detected_rows: List[List[np.ndarray]],
+    cols: int,
+    rows: int,
+    fallback_x_range: Tuple[float, float],
+    fallback_top_y_ratio: float,
+    fallback_step_ratio: float,
+) -> List[List[np.ndarray]]:
+    """Dựng lưới ID tổng hợp được neo vào vị trí của các hàng đã phát hiện.
+
+    Khi pipeline phát hiện được ít nhất 1 hàng SBD/MaDe (nhưng ít hơn ngưỡng),
+    hàm này dùng tọa độ X/Y thực tế của hàng đó để đặt lưới, thay vì dùng
+    các hằng số tỷ lệ cứng có thể không khớp với tất cả loại máy scan.
+
+    Nếu không có hàng nào được phát hiện (detected_rows rỗng), hàm trả về kết
+    quả của :func:`_build_synthetic_id_rows_fixed_image_position` với các
+    tham số fallback — đảm bảo không có regression cho các trường hợp đã đúng.
+
+    Args:
+        image_shape: Tuple ``(height, width)`` của ảnh đang xử lý.
+        detected_rows: Danh sách hàng đã detect, mỗi hàng là list các contour box.
+        cols: Số cột kỳ vọng (6 cho SBD, 3 cho MaDe).
+        rows: Số hàng cần sinh ra (thường = 10).
+        fallback_x_range: Dải X tỷ lệ ``(x0, x1)`` dùng khi không detect được hàng nào.
+        fallback_top_y_ratio: Tỷ lệ Y đỉnh lưới dùng khi không detect được hàng nào.
+        fallback_step_ratio: Tỷ lệ khoảng cách hàng dùng khi không detect được hàng nào.
+
+    Returns:
+        Danh sách 10 hàng lưới tổng hợp, mỗi hàng là ``cols`` contour box.
+    """
+    h_img, w_img = int(image_shape[0]), int(image_shape[1])
+
+    # --- Không có hàng nào detect được → dùng fallback hằng số cứng như cũ ---
+    if not detected_rows:
+        return _build_synthetic_id_rows_fixed_image_position(
+            image_shape=image_shape,
+            cols=cols,
+            rows=rows,
+            x_range_ratio=fallback_x_range,
+            top_y_ratio=fallback_top_y_ratio,
+            row_step_ratio=fallback_step_ratio,
+        )
+
+    # --- Tính X-range từ toàn bộ box đã detect ---
+    all_rects = []
+    for row in detected_rows:
+        for box in row:
+            all_rects.append(cv2.boundingRect(box))
+
+    if not all_rects:
+        return _build_synthetic_id_rows_fixed_image_position(
+            image_shape=image_shape,
+            cols=cols,
+            rows=rows,
+            x_range_ratio=fallback_x_range,
+            top_y_ratio=fallback_top_y_ratio,
+            row_step_ratio=fallback_step_ratio,
+        )
+
+    x_min_px = min(r[0] for r in all_rects)
+    x_max_px = max(r[0] + r[2] for r in all_rects)
+
+    # --- Kiểm tra Y hợp lệ: vùng SBD/MaDe luôn nằm trong 25% đầu ảnh.
+    # Nếu hàng detect được nằm quá thấp, đó là detection sai (box từ phần khác),
+    # bỏ qua và dùng hằng số fallback để tránh anchor sai vị trí.
+    y_min_px = min(r[1] for r in all_rects)
+    max_valid_y_ratio = 0.25   # ID region should be within the top 25% of image
+    if y_min_px / h_img > max_valid_y_ratio:
+        return _build_synthetic_id_rows_fixed_image_position(
+            image_shape=image_shape,
+            cols=cols,
+            rows=rows,
+            x_range_ratio=fallback_x_range,
+            top_y_ratio=fallback_top_y_ratio,
+            row_step_ratio=fallback_step_ratio,
+        )
+
+    # Tính tỷ lệ X, thêm biên nhỏ để không cắt viền ô
+    margin_px = max(2, int(round((x_max_px - x_min_px) / cols * 0.05)))
+    x0_ratio = float(np.clip((x_min_px - margin_px) / w_img, 0.0, 0.99))
+    x1_ratio = float(np.clip((x_max_px + margin_px) / w_img, x0_ratio + 1e-4, 1.0))
+
+    # --- Tính Y đỉnh lưới từ hàng đã detect có Y nhỏ nhất ---
+    top_y_ratio = float(np.clip(y_min_px / h_img, 0.0, 0.95))
+
+
+    # --- Tính row_step từ khoảng cách giữa các hàng (nếu có ≥ 2 hàng) ---
+    if len(detected_rows) >= 2:
+        row_y_positions = []
+        for row in detected_rows:
+            rects = [cv2.boundingRect(b) for b in row]
+            if rects:
+                row_y_positions.append(float(np.mean([r[1] for r in rects])))
+        row_y_positions.sort()
+        if len(row_y_positions) >= 2:
+            gaps = [row_y_positions[i + 1] - row_y_positions[i] for i in range(len(row_y_positions) - 1)]
+            avg_gap_px = float(np.median(gaps))
+            row_step_ratio = float(np.clip(avg_gap_px / h_img, 0.010, 0.080))
+        else:
+            row_step_ratio = float(np.clip(fallback_step_ratio, 0.010, 0.080))
+    else:
+        # Chỉ có 1 hàng → dùng row_step_ratio tham chiếu
+        row_step_ratio = float(np.clip(fallback_step_ratio, 0.010, 0.080))
+
+    # Đảm bảo top_y_ratio và row_step_ratio không đẩy lưới ra ngoài ảnh
+    max_grid_height_ratio = 1.0 - top_y_ratio - 0.01
+    if rows * row_step_ratio > max_grid_height_ratio:
+        row_step_ratio = max_grid_height_ratio / rows
+
+    return _build_synthetic_id_rows_fixed_image_position(
+        image_shape=image_shape,
+        cols=cols,
+        rows=rows,
+        x_range_ratio=(x0_ratio, x1_ratio),
+        top_y_ratio=top_y_ratio,
+        row_step_ratio=row_step_ratio,
+    )
+
 
 
 def _apply_affine_from_corner_markers(

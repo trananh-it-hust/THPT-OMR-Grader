@@ -70,7 +70,7 @@ SBD_BOXES_PER_ROW: int = 6
 SBD_MAX_ROWS: int = 10
 """Maximum SoBaoDanh digit rows."""
 
-SBD_ROW_TOLERANCE: int = 30
+SBD_ROW_TOLERANCE: int = 25
 """Y-tolerance (px) for grouping SoBaoDanh bubbles into rows."""
 
 SBD_SIZE_TOLERANCE_RATIO: float = 0.35
@@ -187,10 +187,10 @@ ID_GRID_TOP_RATIO: float = 0.072
 ID_GRID_ROW_STEP_RATIO: float = 0.0215
 """Row step ratio for the fixed-position synthetic ID grid."""
 
-ID_SBD_X_RANGE_RATIO: tuple = (0.745, 0.865)
+ID_SBD_X_RANGE_RATIO: tuple = (0.71, 0.83)
 """X-range ratio (left, right) for synthetic SoBaoDanh grid."""
 
-ID_MADE_X_RANGE_RATIO: tuple = (0.90, 0.96)
+ID_MADE_X_RANGE_RATIO: tuple = (0.86, 0.94)
 """X-range ratio (left, right) for synthetic MaDe grid."""
 
 # =========================================================================
