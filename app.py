@@ -34,6 +34,7 @@ import multiprocessing
 from src.pipeline import detect_image, grade_image
 from src.worker import detect_single as _worker_detect_single  # Windows-safe worker
 from src.log_config import logger
+from src import config
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +287,18 @@ def _grade_cached_batch(
             })
             continue
         try:
-            results = grade_image(item["detection"], fill_ratio_part1=f1, fill_ratio_part2=f2, fill_ratio_part3=f3)
+            # Build automatic save path
+            save_dir = Path(config.RESULTS_DIR)
+            stem = Path(name).stem
+            save_path = str(save_dir / f"{stem} - with_grid.jpg")
+
+            results = grade_image(
+                item["detection"],
+                fill_ratio_part1=f1,
+                fill_ratio_part2=f2,
+                fill_ratio_part3=f3,
+                save_path=save_path
+            )
             extracted = _build_structured_answers(results, file_name=name)
             batch.append({
                 "file_name": name, "status": "OK", "error": "",
@@ -694,6 +706,32 @@ if multiprocessing.current_process().name == 'MainProcess':
             width="stretch",
             disabled=not combined_payload,
         )
+
+        # --- GALLERY VIEW (New Feature) ---
+        if success_items:
+            st.markdown("---")
+            with st.expander("🖼️ THƯ VIỆN KẾT QUẢ HÀNG LOẠT", expanded=True):
+                st.write(f"Đang hiển thị {len(success_items)} ảnh kết quả cuối cùng:")
+                
+                # Tạo lưới 3 cột
+                n_cols = 3
+                for i in range(0, len(success_items), n_cols):
+                    cols = st.columns(n_cols)
+                    for j in range(n_cols):
+                        if i + j < len(success_items):
+                            item = success_items[i + j]
+                            with cols[j]:
+                                # Hiển thị ảnh kèm caption là Tên file và SBD
+                                sbd = item["extracted"].get("header", {}).get("SBD", "???")
+                                made = item["extracted"].get("header", {}).get("MaDe", "???")
+                                caption = f"📄 {item['file_name']}\n(SBD: {sbd} - Mã: {made})"
+                                
+                                st.image(
+                                    _to_rgb(item["results"]["result_image"]), 
+                                    caption=caption,
+                                    use_container_width=True
+                                )
+                                st.markdown("<br>", unsafe_allow_html=True)
 
         # Per-image detail view
         if success_items:

@@ -11,6 +11,7 @@ Pipeline position: Top-level entry point.
 from __future__ import annotations
 
 from src.log_config import logger
+from src import config
 
 import argparse
 from pathlib import Path
@@ -599,14 +600,21 @@ def run_pipeline(image_arg: Optional[str] = None) -> None:
         combined_grid_image = draw_filled_cells_overlay(
             combined_grid_image, all_evals, color=(0, 255, 0), alpha=0.35,
         )
-        if binary_threshold is not None:
+        if binary_for_eval is not None:
             binary_fillratio_path = f"{debug_prefix}_binary_fillratio_grid.jpg"
-            draw_binary_fillratio_debug(binary_threshold, all_evals, binary_fillratio_path)
+            draw_binary_fillratio_debug(binary_for_eval, all_evals, binary_fillratio_path)
             logger.info(f"✓ Binary fill-ratio debug image saved to: {binary_fillratio_path}")
 
     combined_grid_path = f"{debug_prefix}_all_parts_with_grid.jpg"
     cv2.imwrite(combined_grid_path, combined_grid_image)
     logger.info(f"\n✓ Combined grid image saved to: {combined_grid_path}")
+
+    # --- Save final result to centralized directory ---
+    results_dir = Path(config.RESULTS_DIR)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    final_output_path = results_dir / f"{image_path.stem} - with_grid.jpg"
+    cv2.imwrite(str(final_output_path), combined_grid_image)
+    logger.info(f"✓ Final result saved to: {final_output_path}")
 
 
 # =========================================================================
@@ -996,6 +1004,7 @@ def grade_image(
     fill_ratio_part1: float = 0.55,
     fill_ratio_part2: float = 0.55,
     fill_ratio_part3: float = 0.55,
+    save_path: Optional[str] = None,
 ) -> Dict[str, object]:
     """Apply fill-ratio thresholds to pre-computed raw evals from :func:`detect_image`.
 
@@ -1040,6 +1049,12 @@ def grade_image(
     all_evals = part_i_evals + part_ii_evals + part_iii_evals
     if all_evals:
         result_image = draw_filled_cells_overlay(result_image, all_evals, color=(0, 255, 0), alpha=0.35)
+
+    if save_path:
+        # Tự động tạo thư mục nếu cần thiết trước khi lưu (đảm bảo tính ổn định)
+        from pathlib import Path
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(save_path, result_image)
 
     return {
         "preprocess_mode":  detection["preprocess_mode"],
@@ -1097,3 +1112,40 @@ def process_image(
         fill_ratio_part2=fill_ratio_part2,
         fill_ratio_part3=fill_ratio_part3,
     )
+
+
+def run_batch_cli() -> None:
+    """Scan the PhieuQG/ directory and process all images in a loop for CLI users."""
+    import time
+    search_dir = Path("PhieuQG")
+    if not search_dir.exists():
+        logger.error(f"Thư mục '{search_dir}' không tồn tại.")
+        return
+
+    valid_exts = (".jpg", ".jpeg", ".png", ".bmp", ".BMP")
+    image_files = sorted([p for p in search_dir.iterdir() if p.suffix in valid_exts])
+
+    total = len(image_files)
+    if total == 0:
+        logger.warning(f"Không tìm thấy ảnh nào trong thư mục '{search_dir}'.")
+        return
+
+    logger.info(f"🚀 Bắt đầu xử lý hàng loạt {total} ảnh trong thư mục '{search_dir}'...")
+    t_start = time.time()
+    success_count = 0
+
+    for idx, img_path in enumerate(image_files):
+        try:
+            logger.info(f"\n--- [{idx + 1}/{total}] Processing: {img_path.name} ---")
+            run_pipeline(image_arg=str(img_path))
+            success_count += 1
+        except Exception as e:
+            logger.error(f"❌ Lỗi khi xử lý {img_path.name}: {e}")
+
+    elapsed = time.time() - t_start
+    logger.info(f"\n✅ HOÀN THÀNH XỬ LÝ HÀNG LOẠT!")
+    logger.info(f"   - Tổng số ảnh:  {total}")
+    logger.info(f"   - Thành công:   {success_count}")
+    logger.info(f"   - Thất bại:    {total - success_count}")
+    if total > 0:
+        logger.info(f"   - Thời gian:    {elapsed:.1f}s (TB {elapsed/total:.2f}s/ảnh)")

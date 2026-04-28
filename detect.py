@@ -93,7 +93,7 @@ from src.debug_draw import (
 )
 
 # Pipeline
-from src.pipeline import run_pipeline as _demo
+from src.pipeline import run_pipeline as _demo, run_batch_cli
 
 
 if __name__ == "__main__":
@@ -113,4 +113,8 @@ if __name__ == "__main__":
         help="Định danh ảnh (chấp nhận cùng định dạng như tham số vị trí image).",
     )
     args = parser.parse_args()
-    _demo(image_arg=args.image_opt or args.image)
+    image_id = args.image_opt or args.image
+    if image_id:
+        _demo(image_arg=image_id)
+    else:
+        run_batch_cli()

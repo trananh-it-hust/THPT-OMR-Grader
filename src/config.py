@@ -194,8 +194,8 @@ ID_MADE_X_RANGE_RATIO: tuple = (0.86, 0.94)
 """X-range ratio (left, right) for synthetic MaDe grid."""
 
 # =========================================================================
-#  Affine retry
+#  Output Paths
 # =========================================================================
 
-AFFINE_RETRY_THRESHOLD: int = 4
-"""Row threshold: only attempt topview affine when both SBD and MaDe rows ≤ this."""
+RESULTS_DIR: str = "results_output"
+"""Directory for final graded result images (with bubbles and sections)."""

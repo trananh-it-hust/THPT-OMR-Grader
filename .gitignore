@@ -26,4 +26,5 @@ CoreRules
 # OS generated files
 .DS_Store
 Thumbs.db
-
+results_output
+output
